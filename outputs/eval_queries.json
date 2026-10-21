@@ -1,0 +1,62 @@
+[
+  {
+    "keyword": "CXL",
+    "question": "CXL 메모리 기술이란?"
+  },
+  {
+    "keyword": "PIM",
+    "question": "PIM 반도체의 장점"
+  },
+  {
+    "keyword": "TSMC",
+    "question": "TSMC 파운드리 점유율"
+  },
+  {
+    "keyword": "리벨리온",
+    "question": "리벨리온 NPU 제품"
+  },
+  {
+    "keyword": "퓨리오사",
+    "question": "퓨리오사AI 칩 개발"
+  },
+  {
+    "keyword": "엑사원",
+    "question": "엑사원 모델 공개"
+  },
+  {
+    "keyword": "MLPerf",
+    "question": "MLPerf 벤치마크 결과"
+  },
+  {
+    "keyword": "CoWoS",
+    "question": "CoWoS 패키징 공급 부족"
+  },
+  {
+    "keyword": "딥시크",
+    "question": "딥시크 R1 출시 영향"
+  },
+  {
+    "keyword": "블랙웰",
+    "question": "엔비디아 블랙웰 출시"
+  },
+  {
+    "keyword": "TPU",
+    "question": "구글 TPU 개발 현황"
+  },
+  {
+    "keyword": "소버린",
+    "question": "소버린 AI 전략"
+  },
+  {
+    "keyword": "온디바이스",
+    "question": "온디바이스 AI 칩"
+  },
+  {
+    "keyword": "HBM",
+    "question": "HBM이란 무엇인가?"
+  },
+  {
+    "keyword": "NPU",
+    "question": "NPU와 GPU의 차이"
+  }
+]

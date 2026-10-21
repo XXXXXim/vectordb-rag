@@ -1,0 +1,21 @@
+# 가상환경
+.venv/
+
+# 데이터 (각 기관 원문이라 레포에는 올리지 않음. README에 출처만 표기)
+data/pdfs/
+
+# 큰 산출물 (다시 만들 수 있음)
+outputs/*.npy
+outputs/*.faiss
+
+# 원문 텍스트 청크 (저작권상 제외, 01 노트북으로 재생성 가능)
+outputs/chunks.jsonl
+
+# Qdrant 저장소 (Docker가 자동 생성)
+qdrant_storage/
+
+# 기타
+.ipynb_checkpoints/
+__pycache__/
+.DS_Store
+.env

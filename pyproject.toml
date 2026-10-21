@@ -1,0 +1,24 @@
+[project]
+name = "vectordb-rag"
+version = "0.1.0"
+description = "AI·반도체 정책 리포트 RAG — Dense → Hybrid → Rerank 검색 품질 비교"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "pymupdf>=1.24",                   # PDF 텍스트 추출
+    "langchain-text-splitters>=0.3",   # 청킹
+    "numpy",
+    "pandas",
+    "FlagEmbedding>=1.2",              # BGE-M3 임베딩, BGE-Reranker
+    "faiss-cpu>=1.8",                  # 임시 벡터 검색
+    "qdrant-client>=1.9",              # 벡터 DB
+    "bm25s>=0.2",                      # 키워드 검색
+    "ragas>=0.2",                      # RAG 평가
+    "langchain-community<0.4",         # ragas 0.4.3이 0.4에서 삭제된 vertexai 모듈을 import함
+    "ipywidgets",                      # 노트북 tqdm 진행 막대 (IProgress 경고 해결)
+    "ipykernel",                       # VS Code 노트북 커널
+    "python-dotenv>=1.2.4",            # .env의 OPENAI_API_KEY 읽기
+    "langchain-openai>=1.7.2",         # RAGAS 채점 LLM·임베딩 연결
+    "openai>=3.3.0",                   # 답변 생성 LLM
+    "matplotlib>=3.11.2",              # 결과 막대그래프
+]
