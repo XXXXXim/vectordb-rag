@@ -10,6 +10,16 @@ mode: "dense" | "bm25" | "hybrid" | "rerank"  (03과 같은 파라미터: 후보
 - 청크는 outputs/chunks.jsonl, 청크 벡터는 outputs/embeddings.npy 를 그대로 재사용한다 (다시 임베딩하지 않음)
 - Qdrant 컬렉션이 이미 있고 포인트 수가 청크 수와 같으면 재사용, 아니면 02 방식대로 새로 만든다
 - 모델(BGE-M3, Reranker)은 처음 필요할 때 한 번만 불러온다 (import만 할 때는 가볍게)
+
+환경 변수 (모두 선택. 없으면 기본값으로 동작, 프로젝트 루트 .env.example 참고)
+    QDRANT_HOST    Qdrant 서버 주소          (기본 localhost)
+    QDRANT_PORT    Qdrant 서버 포트          (기본 6333)
+    RAG_DEVICE     cuda / mps / cpu 강제 지정 (기본: 자동 감지)
+    RAG_USE_FP16   1 / 0 으로 fp16 강제 지정  (기본: CUDA에서만 1)
+
+캐시 관리
+    clear_caches()  청크·BM25·Qdrant 클라이언트·모델 캐시를 비우고 메모리를 돌려준다.
+                    chunks.jsonl / embeddings.npy 를 다시 만든 뒤, 또는 오래 띄워 둔 서버에서 메모리를 비울 때 호출.
 """
 import logging
 
@@ -18,7 +28,9 @@ logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLeve
 import torch
 from FlagEmbedding import BGEM3FlagModel, FlagReranker
 
+import gc
 import json
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -39,13 +51,62 @@ CANDIDATES = 50   # Hybrid에서 Dense·BM25 각각 뽑는 후보 수
 RRF_K = 60        # RRF 완충 상수
 RERANK_TOP = 20   # Reranker가 다시 채점할 후보 수
 
-DEVICE = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+# ─────────────────────────────────────────────────────────────
+# 실행 환경 설정 (교수님 피드백 2·3 반영)
+# ─────────────────────────────────────────────────────────────
+# [피드백 2] Qdrant 접속 정보를 코드에 박아두지 않고 환경 변수로 받는다.
+#   로컬 Docker → 기본값(localhost:6333) 그대로
+#   다른 서버/컨테이너로 배포 → 코드 수정 없이 QDRANT_HOST, QDRANT_PORT만 바꾸면 된다.
+try:  # 프로젝트 루트의 .env 도 읽는다 (이미 설정된 환경 변수가 있으면 그쪽이 우선)
+    from dotenv import load_dotenv
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
+except ImportError:
+    pass
+
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+
+
+def _detect_device() -> str:
+    """RAG_DEVICE가 있으면 그대로 쓰고, 없으면 cuda → mps → cpu 순서로 자동 선택."""
+    forced = os.getenv("RAG_DEVICE")
+    if forced:
+        return forced
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _env_flag(name: str) -> bool | None:
+    """환경 변수 "1"/"true" → True, "0"/"false" → False, 없으면 None."""
+    value = os.getenv(name)
+    if value is None:
+        return None
+    return value.strip().lower() in ("1", "true", "yes")
+
+
+DEVICE = _detect_device()
+
+# [피드백 3] fp16(절반 정밀도)은 CUDA에서만 기본으로 켠다.
+#   MPS(Apple Silicon)·CPU에서는 PyTorch 커널이 fp16을 일부 지원하지 않아 예외가 날 수 있어서 fp32가 기본.
+#   (이 프로젝트의 M5 MPS에서는 fp16도 동작했으므로, 속도가 필요하면 RAG_USE_FP16=1 로 직접 켤 수 있게 열어 둠)
+_fp16_override = _env_flag("RAG_USE_FP16")
+USE_FP16 = (DEVICE == "cuda") if _fp16_override is None else _fp16_override
+
+
+def describe_config() -> dict:
+    """지금 어떤 설정으로 돌고 있는지 확인용 (노트북에서 print 해보기)."""
+    return {"device": DEVICE, "use_fp16": USE_FP16, "qdrant": f"{QDRANT_HOST}:{QDRANT_PORT}", "collection": COLLECTION}
 
 
 # ─────────────────────────────────────────────────────────────
 # 데이터 · 모델 · DB (처음 호출될 때 한 번만 만들고 이후엔 재사용 = lru_cache)
+#   인자가 없는 함수라 저장할 결과는 항상 1개 → maxsize=1
+#   비울 때는 아래 clear_caches() 사용
 # ─────────────────────────────────────────────────────────────
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1)
 def load_chunks() -> list[dict]:
     with open(CHUNKS_PATH, encoding="utf-8") as f:
         chunks = [json.loads(line) for line in f]
@@ -57,20 +118,20 @@ def get_chunk(chunk_id: int) -> dict:
     return load_chunks()[chunk_id]
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1)
 def load_embed_model() -> BGEM3FlagModel:
-    return BGEM3FlagModel("BAAI/bge-m3", devices=DEVICE, use_fp16=(DEVICE != "cpu"), normalize_embeddings=True)
+    return BGEM3FlagModel("BAAI/bge-m3", devices=DEVICE, use_fp16=USE_FP16, normalize_embeddings=True)
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1)
 def load_reranker() -> FlagReranker:
-    return FlagReranker("BAAI/bge-reranker-v2-m3", devices=DEVICE, use_fp16=(DEVICE != "cpu"), max_length=512)
+    return FlagReranker("BAAI/bge-reranker-v2-m3", devices=DEVICE, use_fp16=USE_FP16, max_length=512)
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1)
 def get_qdrant() -> QdrantClient:
     """Qdrant에 연결하고, 컬렉션이 없거나 개수가 다르면 embeddings.npy로 02 방식대로 다시 만든다."""
-    client = QdrantClient(host="localhost", port=6333, timeout=60, check_compatibility=False)
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=60, check_compatibility=False)
     chunks = load_chunks()
 
     if client.collection_exists(COLLECTION) and client.count(COLLECTION, exact=True).count == len(chunks):
@@ -116,11 +177,43 @@ def tokenize_korean(text: str) -> list[str]:
     return tokens
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1)
 def load_bm25() -> bm25s.BM25:
     retriever = bm25s.BM25()
     retriever.index([tokenize_korean(c["text"]) for c in load_chunks()], show_progress=False)
     return retriever
+
+
+# ─────────────────────────────────────────────────────────────
+# 캐시 관리 (교수님 피드백 4 반영)
+# ─────────────────────────────────────────────────────────────
+_DATA_CACHES = (load_chunks, load_bm25, get_qdrant)       # 데이터 파일이 바뀌면 다시 만들어야 하는 것
+_MODEL_CACHES = (load_embed_model, load_reranker)        # 메모리를 가장 많이 차지하는 것 (각 2GB 안팎)
+
+
+def clear_caches(data: bool = True, models: bool = True) -> None:
+    """lru_cache로 잡아 둔 객체를 비우고 메모리를 돌려준다.
+
+    - data=True  : chunks.jsonl / embeddings.npy를 다시 만든 뒤 호출 → 다음 검색 때 새 데이터로 다시 로딩
+                   (청크 수가 바뀌었으면 get_qdrant()가 컬렉션도 다시 만든다)
+    - models=True: 모델 2개(BGE-M3, Reranker)를 메모리에서 내린다 → 다음 검색 때 다시 로딩(수 초)
+    """
+    if data and get_qdrant.cache_info().currsize:
+        get_qdrant().close()                 # 열려 있는 Qdrant 연결부터 정리
+    targets = (_DATA_CACHES if data else ()) + (_MODEL_CACHES if models else ())
+    for fn in targets:
+        fn.cache_clear()
+    gc.collect()                             # 파이썬이 들고 있던 객체 정리
+    if models:                               # GPU/MPS 메모리도 돌려준다
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+
+
+def cache_status() -> dict:
+    """어떤 캐시가 지금 메모리에 올라와 있는지 확인용 (1 = 로딩됨, 0 = 비어 있음)."""
+    return {fn.__name__: fn.cache_info().currsize for fn in _DATA_CACHES + _MODEL_CACHES}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -138,6 +231,7 @@ def dense_search(query: str, k: int = 50, query_filter: models.Filter | None = N
 
 
 def bm25_search(query: str, k: int = 50, mask: np.ndarray | None = None) -> list[int]:
+    """mask: 청크 수와 길이가 같은 bool 배열 (True = 검색 대상). 조건 밖 청크는 점수 0이 되어 아래에서 빠진다."""
     ids, scores = load_bm25().retrieve([tokenize_korean(query)], k=k, show_progress=False, weight_mask=mask)
     return [int(i) for i, s in zip(ids[0], scores[0]) if s > 0]
 
@@ -178,12 +272,14 @@ def search(query: str, k: int = 5, mode: str = "rerank", category: str | None = 
         conditions.append(models.FieldCondition(key="year", range=models.Range(gte=year_gte)))
     query_filter = models.Filter(must=conditions) if conditions else None
 
+    # [피드백 1] BM25 필터 mask는 "넣을지/뺄지"를 나타내는 값이라 bool 배열로 만든다.
+    #   (float32 0/1도 곱셈으로는 같게 동작하지만, 의미가 분명하고 타입 불일치로 필터가 무시될 여지를 없앤다)
     mask = None
     if conditions:
         mask = np.array([
             (category is None or c["category"] == category) and (year_gte is None or c["year"] >= year_gte)
             for c in load_chunks()
-        ], dtype=np.float32)
+        ], dtype=bool)
 
     if mode == "dense":
         return dense_search(query, k=k, query_filter=query_filter)

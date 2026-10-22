@@ -25,7 +25,7 @@ PDF 16개 → 로딩·전처리 → 청킹(500자/50자 오버랩) → BGE-M3 �
         → BM25 + RRF(Hybrid) → BGE-Reranker → RAGAS 평가
 ```
 
-검색 함수는 `src/rag_search.py`에 모듈로 분리되어 있다(`search(query, k, mode, category, year_gte)`, mode = dense / bm25 / hybrid / rerank).
+검색 함수는 `src/rag_search.py`에 모듈로 분리되어 있다(`search(query, k, mode, category, year_gte)`, mode = dense / bm25 / hybrid / rerank). Qdrant 주소·device·fp16은 환경 변수로 바꿀 수 있고(`.env.example`), `clear_caches()`로 모델·데이터 캐시를 비울 수 있다.
 
 ## 진행 상황
 - [x] 01. PDF 로딩 · 전처리 · 청킹 (`notebooks/01_vectordb_basics.ipynb`)
@@ -69,20 +69,57 @@ PDF 16개 → 로딩·전처리 → 청킹(500자/50자 오버랩) → BGE-M3 �
   - RAGAS는 영어로 질문을 역생성해 Answer Relevancy가 언어 차이로 깎였다(0.48). 채점 LLM에 한국어 지시를 주니 0.68로 정상화됐다.
 - **키워드 근사 지표와 RAGAS는 모드 순위만 같다.** 질문 단위 상관은 0.11로 거의 무관했다. 반면 "근거 청크를 가져왔나"와 Context Recall의 상관은 0.84였다. 빠른 점검은 키워드 지표로 하고, 최종 판단은 근거 기반 지표로 해야 한다.
 
+## 교수님 코드 리뷰 피드백 반영 (2026.10.22)
+
+실습 제출 후 받은 코드 리뷰를 `src/rag_search.py`에 반영했다. 리뷰 원문 요지와 바꾼 내용, 확인 방법을 같이 남긴다.
+
+> 전체적으로 모듈화가 잘 되어 있고, `lru_cache`를 통한 모델 로딩 최적화나 정규표현식을 활용한 한국어 토크나이저 구현 등 고민한 흔적이 보인다. 실무 환경의 버그 방지·안정성·성능 관점에서 4가지를 보완하면 완성도 높은 RAG 엔진이 될 것이다.
+
+| # | 피드백 | 수정 전 | 수정 후 | 확인 |
+|---|---|---|---|---|
+| 1 | BM25 필터 `weight_mask`는 bool 배열로 | `dtype=np.float32` (0/1) | `dtype=bool` | 5개 질문 × 4개 필터 조합 20/20에서 float32와 결과 동일, 조건 밖 청크 0개 |
+| 2 | Qdrant 접속 정보 환경 변수화 | `host="localhost", port=6333` 하드코딩 | `QDRANT_HOST`, `QDRANT_PORT` (기본값 localhost:6333), 프로젝트 루트 `.env`도 읽음 | 기본값 / 환경 변수 / `.env` / 우선순위(환경 변수 > `.env`) 4가지 확인 |
+| 3 | MPS에서 fp16 예외 가능 → CUDA에서만 fp16 | `use_fp16=(DEVICE != "cpu")` → MPS에서도 fp16 | `USE_FP16 = DEVICE == "cuda"` (MPS·CPU는 fp32). `RAG_USE_FP16=1`로 직접 켤 수 있게 열어 둠 | cuda/mps/cpu × 환경 변수 6가지 조합에서 두 모델 모두 설정 반영 확인 |
+| 4 | 장시간 운용 대비 캐시 초기화 함수 | `lru_cache(maxsize=None)`, 비우는 방법 없음 | `clear_caches(data=True, models=True)`, `cache_status()` 추가, `maxsize=1` | 비운 뒤 5개 캐시 0, 다시 검색해도 같은 결과 |
+
+**추가로 한 것**
+- `describe_config()`: 지금 어떤 device·fp16·Qdrant 주소로 도는지 바로 확인
+- `.env.example`: 설정 가능한 환경 변수 목록
+- `tests/smoke_test.py`: 위 4가지 + 04 노트북 캐시 결과와의 회귀 비교를 한 번에 점검 (`uv run python tests/smoke_test.py`)
+
+**검증 결과** (`tests/smoke_test.py`, 실제 BGE-M3·BGE-Reranker·bm25s, fp32)
+
+| 점검 | 결과 |
+|---|---|
+| 설정 | fp16은 CUDA에서만 기본 사용 (CPU/MPS → fp32) ✅ |
+| BM25 bool mask 필터 | 3개 조건 모두 조건 밖 청크 0개, float32 mask와 결과 동일 ✅ |
+| 회귀 (04 캐시 결과 33건과 top-5 비교) | Dense 1.00 · Hybrid 1.00 · Rerank 0.98 (1건만 5개 중 4개 일치) ✅ |
+| `clear_caches()` | 5개 캐시 모두 비워지고, 다시 검색해도 정상 ✅ |
+
+Rerank 1건의 차이는 04를 돌릴 때(MPS fp16)와 지금(fp32)의 정밀도 차이로 Reranker 점수가 미세하게 달라져 5위 경계에서 순서가 바뀐 것이다. 검색 로직 변경으로 생긴 차이는 없다.
+
+**생각해 볼 점.** 3번은 안정성을 우선한 선택이다. 이 프로젝트의 M5(MPS)에서는 fp16도 문제없이 돌았고 Reranker가 질문당 약 650ms였는데, fp32로 바꾸면 메모리를 두 배 쓰고 속도도 느려질 수 있다. 그래서 기본값은 교수님 말씀대로 CUDA 전용으로 두고, 속도가 필요하면 환경 변수로 켜는 구조로 했다. 1번은 bm25s 0.3.14 내부에서 mask를 점수에 곱하는 방식이라 float32 0/1도 결과는 같았다. 다만 "넣을지/뺄지"라는 의미가 타입에 드러나고, 라이브러리 구현이 바뀌어도 필터가 무시될 여지가 없다는 점에서 bool이 맞다고 봤다.
+
 ## 실행 방법
 ```bash
 uv sync                      # 가상환경 + 패키지 설치
 docker run -d --name qdrant -p 6333:6333 \
   -v "$(pwd)/qdrant_storage:/qdrant/storage" qdrant/qdrant
 
-# 04(RAGAS)용 OpenAI API 키: 프로젝트 루트에 .env 파일 생성 (.gitignore에 포함되어 커밋되지 않음)
-echo "OPENAI_API_KEY=sk-..." > .env
+# 설정 파일: .env.example을 복사해서 OPENAI_API_KEY 입력 (04 RAGAS용, .env는 커밋되지 않음)
+cp .env.example .env
 
 # VS Code에서 notebooks/ 노트북을 01 → 04 순서로 열고 커널을 .venv로 선택
+
+# 검색 모듈 점검 (01~02 실행 후, Qdrant가 켜져 있을 때)
+uv run python tests/smoke_test.py
 ```
 - 04는 OpenAI API를 사용한다(11문항 전체 첫 실행 약 377회 호출, 약 $0.29). 답변과 점수는 `outputs/`에 캐시되어 재실행하면 API를 다시 호출하지 않는다.
 - 노트북 설정 셀의 `RUN_QIDS = ["Q01", "Q05"]`로 일부 질문만 먼저 테스트할 수 있다.
 - macOS 주의: torch(FlagEmbedding)를 faiss보다 먼저 import해야 하고, faiss는 `omp_set_num_threads(1)`로 실행한다. libomp 충돌로 커널이 죽는 문제를 막기 위해서다.
+
+## 학습 노트
+- [Talking About 복습 노트](docs/talking_about_review.md): 실습 전에 개념 교재 전체를 친구에게 설명하는 방식으로 복습한 기록. 임베딩 → 청킹 → Vector DB → Hybrid Search → Re-ranking → Agentic RAG → RAGAS → MEMO 흐름을 비유 중심으로 정리했다.
 
 ## 기술 스택
 Python 3.11 · PyMuPDF · LangChain Text Splitters · BGE-M3 · FAISS · Qdrant · bm25s · BGE-Reranker · RAGAS · OpenAI (gpt-4.1-mini)
